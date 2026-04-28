@@ -1,0 +1,294 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Contract Architecture Patterns
+
+Structural patterns for organizing intelligent contracts at scale — factory deployment, sharding, data separation, and cross-contract communication.
+
+## Factory Pattern
+
+A factory contract holds the implementation code as a string and deploys child contracts on demand. Upgrading the factory's `campaign_code` field changes what all future deployments run — existing deployed contracts are unaffected.
+
+```python
+class CampaignFactory(gl.Contract):
+    campaign_code: str
+    shard_code: str
+    contract_addresses: DynArray[str]
+
+    def __init__(self, ...):
+        # Read implementation code at factory deploy time
+        with open("/contract/CampaignIC.py", "rt") as f:
+            self.campaign_code = f.read()
+        with open("/contract/CampaignShard.py", "rt") as f:
+            self.shard_code = f.read()
+
+    @gl.public.write
+    def create_campaign(self, id: str, title: str, ...) -> str:
+        salt_nonce = len(self.contract_addresses) + 1  # salt_nonce cannot be 0
+        campaign_address = gl.deploy_contract(
+            code=self.campaign_code.encode("utf-8"),
+            args=[title, goal, ..., self.shard_code],
+            salt_nonce=salt_nonce,
+            on="accepted",
+        )
+        self.contract_addresses.append(campaign_address.as_hex)
+        self.id_to_address[id] = campaign_address.as_hex
+        return campaign_address.as_hex
+
+    @gl.public.write
+    def update_campaign_code(self, new_campaign_code: str) -> None:
+        """Updates the campaign implementation code. Only the owner can call this."""
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("Only the owner can update the campaign code")
+        self.campaign_code = new_campaign_code
+```
+
+The `id_to_address` mapping lets callers resolve a human-readable campaign ID to its on-chain address without enumerating all contracts.
+
+## Shard Deployment
+
+Each campaign deploys N child "shard" contracts in its `__init__`. Shards are deployed with `salt_nonce=i+1` (starting at 1, since 0 is reserved) so their addresses are deterministic and can be stored immediately.
+
+```python
+def __init__(self, ..., num_shards: int = 3, shard_code: str = ""):
+    self.num_shards = num_shards
+
+    # Deploy N shards in sequence
+    for i in range(num_shards):
+        shard_address = gl.deploy_contract(
+            code=shard_code.encode("utf-8"),
+            args=[
+                i,                              # shard_index
+                gl.message.contract_address,    # main_campaign_address
+            ],
+            salt_nonce=i + 1,  # nonce 1, 2, 3, ...
+            on="accepted",
+        )
+        self.shard_addresses.append(shard_address)
+```
+
+Each shard stores a reference to its parent and enforces it on every write:
+
+```python
+class CampaignShard(gl.Contract):
+    main_campaign_address: Address
+
+    def _require_main_campaign(self):
+        """Only main campaign can call write methods"""
+        if gl.message.sender_address != self.main_campaign_address:
+            raise gl.vm.UserError(
+                f"{ERROR_PREFIX_EXPECTED} Only main campaign can call this method"
+            )
+
+    @gl.public.write
+    def analyze_submission(self, ...):
+        self._require_main_campaign()
+        # ...
+```
+
+## Data Separation (Main vs Shard)
+
+The main contract handles routing and stores raw submission data. The shard handles expensive LLM analysis and stores scored results. This keeps LLM work async and off the critical path of submission acceptance.
+
+```python
+# MainSubmission — stored in CampaignIC
+@allow_storage
+@dataclass
+class MainSubmission:
+    mission_id: str
+    user: str
+    tweet_id: str
+    period_index: u256
+    timestamp: str          # ISO format — when submitted
+    tweet_datetime: str     # ISO format — when tweet was posted
+    shard_index: u256       # Which shard handles this submission
+    analysis: DynArray[AnalysisRecord]  # Originality + raw metrics
+    status: str             # MAIN_ROUTED | MAIN_ORIGINALITY_FAILED
+    tweet_text: str
+    tweet_thread: str       # JSON string
+    replies: str            # JSON string
+    atto_raw_retweets: u256
+    atto_raw_likes: u256
+    atto_raw_replies: u256
+    atto_raw_follower_reach: u256
+    atto_raw_impressions: u256
+
+
+# ShardSubmission — stored in CampaignShard
+@allow_storage
+@dataclass
+class ShardSubmission:
+    tweet_id: str
+    user: str
+    mission_id: str
+    period_index: u256
+    timestamp: str
+    atto_m_gate: u256       # Gate multiplier (0 or product of gate weights)
+    atto_quality_q: u256    # Quality score (EP + TQ)
+    atto_engagement_q: u256 # Engagement score (RT + LK + RP + QR + FR)
+    atto_raw_score: u256    # m_gate * (quality_q + engagement_q)
+    gate_pass: bool
+    analysis: DynArray[AnalysisRecord]  # All 6 LLM analysis records
+    is_resubmission: bool
+    referrer: str
+    atto_referral_bonus: u256
+    atto_external_multiplier: u256
+```
+
+The main contract never stores LLM analysis results directly. The shard never reads main storage — all data it needs is pushed to it via method arguments.
+
+## `_build_submission_payload` — Push Not Pull
+
+Before routing a submission to a shard, the main contract packages all the data the shard will need into a plain dict. The shard's `analyze_submission` method receives this dict as an argument and never needs to call back to main.
+
+```python
+def _build_submission_payload(
+    self, submission: MainSubmission
+) -> dict[str, typing.Any]:
+    """Build compact submission payload passed from main -> shard for analysis."""
+    return {
+        "tweet_id": submission.tweet_id,
+        "user": submission.user,
+        "mission_id": submission.mission_id,
+        "period_index": int(submission.period_index),
+        "timestamp": submission.timestamp,
+        "tweet_datetime": submission.tweet_datetime,
+        "tweet_text": submission.tweet_text,
+        "tweet_thread": submission.tweet_thread,
+        "replies": submission.replies,
+        "raw_metrics": {
+            "atto_retweets": int(submission.atto_raw_retweets),
+            "atto_likes": int(submission.atto_raw_likes),
+            "atto_replies": int(submission.atto_raw_replies),
+            "atto_follower_reach": int(submission.atto_raw_follower_reach),
+            "atto_impressions": int(submission.atto_raw_impressions),
+        },
+        "referrer": submission.referrer,
+    }
+
+# Usage — route to shard after storing submission
+shard_contract.emit(on='accepted').analyze_submission(
+    mission_id,
+    tweet_id,
+    now_period_index,
+    self._build_submission_payload(new_submission),
+    self._build_shard_analysis_context(mission_id),
+)
+```
+
+This push-not-pull pattern avoids cross-contract reads inside the shard's nondet block, which would add latency and introduce storage-snapshot ordering issues.
+
+## `_build_shard_analysis_context`
+
+Campaign configuration (mission rules, scoring weights, prompts) is also packaged separately from submission data. This lets shard methods be stateless with respect to main storage.
+
+```python
+def _build_shard_analysis_context(self, mission_id: str) -> dict[str, typing.Any]:
+    """Build per-submission campaign context passed to shard analysis methods."""
+    mission = self.missions[mission_id]
+    return {
+        "mission": {
+            "title": mission.title,
+            "description": mission.description,
+            "rules": mission.rules,
+        },
+        "gate_weights": [int(w) for w in self.gate_weights],
+        "metric_weights": [int(w) for w in self.metric_weights],
+        "beta": int(self.beta),
+        "title": self.title,
+        "goal": self.goal,
+        "style": self.style,
+        "knowledge_base": self.knowledge_base,
+        "rules": self.rules,
+        "external_multiplier_url": self.external_multiplier_url,
+    }
+```
+
+## Batch vs Compact Shard Fetching
+
+Reading from multiple shards is expensive. Use the right fetch method for the path:
+
+- **`_batch_fetch_shard_data`** — returns full `ShardSubmission` records including `analysis` arrays. Use in view methods that need the full analysis (e.g., `get_campaign_info`, `get_submissions`).
+- **`_batch_fetch_shard_compact_data`** — returns scalars only (`atto_raw_score`, `atto_quality_q`, `gate_pass`, etc.). Use in hot write paths (e.g., duplicate checking during submission).
+
+Both methods group requests by shard index to avoid N+1 cross-contract calls:
+
+```python
+def _group_submissions_for_shard_lookup(
+    self, submissions: list[MainSubmission]
+) -> dict[int, list[dict[str, typing.Any]]]:
+    """Group unique routed submission keys by shard index."""
+    groups: dict[int, list[dict[str, typing.Any]]] = {}
+    seen_keys: dict[tuple[str, int, str], bool] = {}
+
+    for sub in submissions:
+        if sub.status != SUBMISSION_STATUS_MAIN_ROUTED:
+            continue
+        key = (sub.tweet_id, int(sub.period_index), sub.mission_id)
+        if key in seen_keys:
+            continue
+        seen_keys[key] = True
+        shard_idx = int(sub.shard_index)
+        if shard_idx not in groups:
+            groups[shard_idx] = []
+        groups[shard_idx].append({
+            "tweet_id": key[0],
+            "period_index": key[1],
+            "mission_id": key[2],
+        })
+    return groups
+
+def _batch_fetch_shard_compact_data(self, submissions: list[MainSubmission]) -> dict:
+    """Batch fetch compact shard data (used by hot write/view paths)."""
+    groups = self._group_submissions_for_shard_lookup(submissions)
+    lookup: dict[tuple, dict] = {}
+    for shard_idx, requested_ids in groups.items():
+        shard_contract = gl.get_contract_at(self.shard_addresses[shard_idx])
+        shard_rows = shard_contract.view().get_submission_compact_by_ids(requested_ids)
+        for row in shard_rows:
+            lookup[(row["tweet_id"], int(row["period_index"]), row["mission_id"])] = row
+    return lookup
+```
+
+## Submission Status State Machine
+
+Submissions flow through a simple linear state machine. Status is stored as a string constant for readability and GenLayer calldata compatibility.
+
+```python
+# Status constants
+SUBMISSION_STATUS_MAIN_ROUTED = "MAIN_ROUTED"
+SUBMISSION_STATUS_MAIN_ORIGINALITY_FAILED = "MAIN_ORIGINALITY_FAILED"
+SUBMISSION_STATUS_SHARD_NOT_FOUND = "SHARD_NOT_FOUND"   # virtual, derived at query time
+SUBMISSION_STATUS_SHARD_SUCCESS = "SHARD_SUCCESS"        # virtual, derived at query time
+```
+
+State transitions:
+
+```
+submit_tweet()
+    │
+    ├─ originality gate fails ──► MAIN_ORIGINALITY_FAILED  (terminal, 0 points)
+    │
+    └─ originality gate passes ─► MAIN_ROUTED
+                                       │
+                              shard.analyze_submission()
+                                       │
+                              ├─ not yet complete ──► SHARD_NOT_FOUND  (transient)
+                              └─ complete ──────────► SHARD_SUCCESS    (terminal)
+```
+
+`SHARD_NOT_FOUND` and `SHARD_SUCCESS` are not stored in main — they are computed by `_enrich_submission_with_shard_data` at query time based on whether shard data exists.
+
+## Round-Robin Shard Routing
+
+Submissions are routed to shards using a single modulo operation on the tweet ID. No coordination required.
+
+```python
+def get_shard_index(self, tweet_id: str) -> u256:
+    """
+    Deterministically select shard for a tweet using round-robin on tweet ID.
+    """
+    tweet_id_int = int(tweet_id)
+    return tweet_id_int % self.num_shards
+```
+
+Tweet IDs are monotonically increasing integers, which gives roughly uniform distribution across shards without any state.

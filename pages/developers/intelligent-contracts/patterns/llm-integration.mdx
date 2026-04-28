@@ -1,0 +1,227 @@
+import { Callout } from 'nextra-theme-docs'
+
+# LLM Integration Patterns
+
+Patterns for calling LLMs reliably inside intelligent contracts — from prompt structure to parsing, embedding serialization, and gate failure detection.
+
+## Prompt Structure
+
+Every LLM task follows the same anatomy: expert persona, XML-tagged inputs, numbered rubric, JSON output mandate.
+
+```python
+def get_content_alignment_task(self, mission, thread_data_json, title, goal, style, knowledge_base):
+    task = f"""
+    You are an expert content analyst specializing in campaign messaging alignment. Your task is to analyze a tweet's alignment with campaign values and provide a comprehensive score from 0 to 2.
+
+    Scoring criteria:
+    1. Message Accuracy
+    - How accurately does the tweet represent the campaign's core message?
+    - Are key features and benefits correctly portrayed?
+
+    2. Terminology Usage
+    - Is campaign-specific terminology used correctly?
+    - Are technical terms accurately represented?
+
+    3. Value Proposition
+    - How well are the core value propositions integrated?
+    - Is the campaign's unique selling point clearly conveyed?
+
+    4. Brand Consistency
+    - Does the messaging align with official campaign style?
+    - Is the tone consistent with campaign guidelines?
+
+    5. Target Audience Alignment
+    - Does the content resonate with the intended audience?
+    - Are audience-specific pain points addressed?
+
+    Here's the input below:
+
+    <thread_data>
+    {thread_data_json}
+    </thread_data>
+
+    <campaign_title>
+    {title}
+    </campaign_title>
+
+    <campaign_goal>
+    {goal}
+    </campaign_goal>
+
+    <campaign_style>
+    {style}
+    </campaign_style>
+
+    <knowledge_base>
+    {knowledge_base}
+    </knowledge_base>
+
+    <mission>
+    {mission["title"]}
+    {mission["description"]}
+    {mission["rules"]}
+    </mission>
+
+    Output format - JSON:
+    {{
+        "analysis": <string: detailed analysis of content alignment>,
+        "score": <integer number between 0-2: overall alignment score where 0=fail, 1=ok, 2=exceptional>
+    }}
+
+    It is mandatory that you respond only using the JSON format above,
+    nothing else. Don't include any other words or characters,
+    your output must be only JSON without any formatting prefix or suffix.
+    This result should be perfectly parsable by a JSON parser without errors.
+    """
+    return task
+```
+
+Key elements:
+
+- **Expert persona** — first sentence establishes the LLM's role and domain
+- **XML-tagged context** — `<thread_data>`, `<campaign_title>`, `<mission>` etc. are easy to diff and easy for the model to parse
+- **Numbered rubric** — explicit criteria with sub-bullets guide the scoring logic
+- **JSON output mandate** — last paragraph repeats the format requirement and forbids any preamble
+- **`response_format="json"`** — passed to `gl.nondet.exec_prompt` to signal structured output
+
+## `_execute_task` Resilient Parser
+
+Never call `gl.nondet.exec_prompt` directly and trust the result. Wrap it with `_execute_task` to handle the common failure modes: wrong key names, float scores, string scores, negative scores.
+
+```python
+def _execute_task(self, task: str) -> dict:
+    """Execute LLM prompt with resilient JSON parsing.
+
+    Handles common LLM response variations:
+    - Key aliasing: rating/points/value/result -> score
+    - Type coercion: "3", 3.5, " 3 " -> 3
+    - Analysis coercion: dict/list -> JSON string
+    """
+    analysis = gl.nondet.exec_prompt(task, response_format="json")
+
+    # Validate response is dict
+    if not isinstance(analysis, dict):
+        raise gl.vm.UserError(f"{ERROR_PREFIX_LLM} LLM returned non-dict response: {type(analysis)}")
+
+    # Key aliasing - handle common alternate key names
+    if "score" not in analysis:
+        for alt_key in ["rating", "points", "value", "result"]:
+            if alt_key in analysis:
+                analysis["score"] = analysis.pop(alt_key)
+                break
+
+    # Extract and coerce score - must exist and be numeric
+    raw_score = analysis.get("score")
+    if raw_score is None:
+        raise gl.vm.UserError(f"{ERROR_PREFIX_LLM} LLM response missing 'score' key. Got: {list(analysis.keys())}")
+
+    try:
+        # Handle int, float, string "3", string "3.5", whitespace
+        score = int(round(float(str(raw_score).strip())))
+    except (ValueError, TypeError):
+        raise gl.vm.UserError(f"{ERROR_PREFIX_LLM} LLM returned non-numeric score: {raw_score}")
+
+    # Ensure non-negative (no upper clamp - tasks have different max: 2 or 5)
+    if score < 0:
+        score = 0
+
+    # Extract analysis - coerce anything to string for display
+    raw_analysis = analysis.get("analysis", "No analysis provided")
+    if isinstance(raw_analysis, (dict, list)):
+        raw_analysis = json.dumps(raw_analysis)
+    else:
+        raw_analysis = str(raw_analysis)
+
+    return {
+        "atto_score": to_atto(score),
+        "analysis": raw_analysis,
+    }
+```
+
+The `[LLM_ERROR]` prefix on parse failures tells `_handle_leader_error` to always disagree — LLM parse errors should trigger a retry, not a consensus agreement on a broken result.
+
+<Callout type="warning">
+  Do not clamp scores to the rubric's upper bound inside `_execute_task`. Different tasks have different maximums (2 for gate checks, 5 for quality metrics). Handle that in the caller.
+</Callout>
+
+## Embedding Serialization (int64 trick)
+
+Float32 embeddings from `genlayer_embeddings` are not bit-for-bit reproducible across different validators (different hardware, rounding differences). You cannot pass raw floats through the nondet boundary and compare them.
+
+**Solution:** Multiply by 1e18, cast to int64, transmit as integers, divide back on the other side.
+
+```python
+# Inside leader_fn — encode before returning
+tweet_embedding = self.get_embedding(tweet_content)  # np.ndarray[float32]
+tweet_embedding_ints = (tweet_embedding * 1e18).astype(np.int64).tolist()
+
+return (
+    all_analyses,
+    user,
+    tweet_embedding_ints,  # safe to compare across validators
+    # ...
+)
+```
+
+```python
+# After gl.vm.run_nondet_unsafe — decode for storage
+tweet_embedding_ints = result[2]
+tweet_embedding = np.array(tweet_embedding_ints, dtype=np.float32) / 1e18
+
+# Store in vector DB
+self.tweet_store.insert(
+    tweet_embedding, VectorStoreValue(text=tweet_content, id=tweet_id)
+)
+```
+
+This is the same trick used for atto/wei encoding (see [Data Modeling Patterns](./data-modeling)). Integers are losslessly comparable across machines; floats are not.
+
+## Gate Failure Detection by Array Length
+
+Instead of a separate status field, use the length of the analysis array to detect gate failures. A complete analysis produces exactly 6 records (3 gates + 3 quality metrics). Fewer records means a gate failed and analysis was short-circuited.
+
+```python
+nondet_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+all_analysis_raw = nondet_result["analyses"]
+
+# 6 records = all gates passed, full analysis complete
+# < 6 records = a gate failed, partial result
+gate_failed = len(all_analysis_raw) < 6
+
+if gate_failed:
+    m_gate, quality_q, engagement_q = 0, 0, 0
+    gate_pass = False
+else:
+    content_alignment_analysis = all_analysis_raw[0]
+    information_accuracy_analysis = all_analysis_raw[1]
+    campaign_compliance_analysis = all_analysis_raw[2]
+    engagement_potential_analysis = all_analysis_raw[3]
+    technical_quality_analysis = all_analysis_raw[4]
+    quality_of_replies_analysis = all_analysis_raw[5]
+    # ... score calculation continues
+```
+
+The `validator_fn` uses the same check to decide whether to compare scores or agree on a gate failure:
+
+```python
+def validator_fn(leaders_res: gl.vm.Result) -> bool:
+    # ...
+    leader_analyses = leader_result["analyses"]
+    validator_analyses = validator_result["analyses"]
+
+    # Gate failures: if both failed ANY gate, treat as agreement
+    if len(validator_analyses) < 6 and len(leader_analyses) < 6:
+        return True
+    if len(validator_analyses) != len(leader_analyses):
+        return False
+    # Compare quality scores (indices 3-5) with tolerance
+    for i in range(3, 6):
+        if not quality_score_comparison(
+            leader_analyses[i]["atto_score"],
+            validator_analyses[i]["atto_score"],
+        ):
+            return False
+    return True
+```
+
+This avoids an extra status field in the return tuple and makes the gate-failure path a natural short-circuit in the leader function.

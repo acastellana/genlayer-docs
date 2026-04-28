@@ -1,0 +1,222 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Consensus & Nondet Patterns
+
+These patterns come from production intelligent contracts and address the hardest part of writing on GenLayer: making non-deterministic work (LLM calls, HTTP requests, embeddings) converge to consensus reliably.
+
+## Unified Nondet Block
+
+Put all external calls — LLM prompts, HTTP requests, and embedding generation — inside a **single** `leader_fn`/`validator_fn` pair. One consensus round covers everything.
+
+```python
+def leader_fn():
+    # All external work happens here: HTTP, LLM, embeddings
+    tweet_data = self.get_tweet_data(proxy_url, tweet_id)
+    tweet_embedding = self.get_embedding(tweet_content)
+    originality_analysis = self._execute_task(originality_task)
+
+    retweets_analysis = {
+        "atto_score": to_atto(tweet_metrics["retweet_count"]),
+        "analysis": f"Tweet received {tweet_metrics['retweet_count']} retweets",
+    }
+
+    all_analyses = [
+        originality_analysis,
+        retweets_analysis,
+        # ... more analyses
+    ]
+
+    # Return everything as a tuple — one round for all results
+    return (
+        all_analyses,
+        user,
+        tweet_content,
+        tweet_embedding_ints,  # serialized (see LLM Integration Patterns)
+    )
+
+def validator_fn(leaders_res: gl.vm.Result) -> bool:
+    if not isinstance(leaders_res, gl.vm.Return):
+        return _handle_leader_error(leaders_res, leader_fn)
+
+    try:
+        validator_raw = leader_fn()
+    except Exception:
+        return False
+
+    validator_analyses, _, _, _ = validator_raw
+    leader_analyses, _, _, _ = leaders_res.calldata
+
+    if len(validator_analyses) != len(leader_analyses):
+        return False
+
+    for i in range(len(leader_analyses)):
+        if not raw_score_comparison(
+            leader_analyses[i]["atto_score"],
+            validator_analyses[i]["atto_score"],
+        ):
+            return False
+    return True
+
+result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+```
+
+The key insight: merging all external calls into one `leader_fn` means you pay the consensus cost once, not once per call.
+
+## `_handle_leader_error`
+
+A module-level helper called at the top of every `validator_fn` when the leader raised an exception. It classifies errors by prefix and decides whether validators should agree or force a retry.
+
+```python
+def _handle_leader_error(leaders_res, leader_fn) -> bool:
+    """Compare validator's re-run error against leader's error for consensus.
+
+    - EXPECTED/EXTERNAL: deterministic → agree only if exact message match
+    - TRANSIENT: agree if both got a transient error (prefix match)
+    - LLM_ERROR/unknown: always disagree to force retry
+    """
+    leader_msg = leaders_res.message if hasattr(leaders_res, 'message') else ''
+    try:
+        leader_fn()
+        return False  # leader errored but validator succeeded → disagree
+    except gl.vm.UserError as e:
+        validator_msg = e.message if hasattr(e, 'message') else str(e)
+        if validator_msg.startswith(ERROR_PREFIX_EXPECTED) or validator_msg.startswith(ERROR_PREFIX_EXTERNAL):
+            return validator_msg == leader_msg  # deterministic → exact match required
+        if validator_msg.startswith(ERROR_PREFIX_TRANSIENT) and leader_msg.startswith(ERROR_PREFIX_TRANSIENT):
+            return True  # both transient → agree
+        return False  # LLM_ERROR or unprefixed → disagree, force retry
+    except Exception:
+        return False  # unexpected error type → disagree
+```
+
+Usage in `validator_fn`:
+
+```python
+def validator_fn(leaders_res: gl.vm.Result) -> bool:
+    if not isinstance(leaders_res, gl.vm.Return):
+        return _handle_leader_error(leaders_res, leader_fn)
+    # ... normal comparison logic
+```
+
+Define this function at module level (outside the contract class) so it can be shared across multiple validator functions in the same contract.
+
+## Error Prefix Constants
+
+Every `raise` in a nondet block should include a prefix so `_handle_leader_error` and the app layer can classify the error correctly.
+
+| Prefix | Meaning | Validator behavior |
+|---|---|---|
+| `[EXPECTED]` | Business logic error, user-actionable | Agree only on exact message match |
+| `[EXTERNAL]` | External API error (e.g. tweet not found, 404) — deterministic | Agree only on exact message match |
+| `[TRANSIENT]` | Transient external error (5xx, timeouts) | Agree if both validators got a transient error |
+| `[LLM_ERROR]` | LLM/GenVM parse error | Always disagree — forces a retry |
+
+```python
+ERROR_PREFIX_EXPECTED = "[EXPECTED]"
+ERROR_PREFIX_EXTERNAL = "[EXTERNAL]"
+ERROR_PREFIX_TRANSIENT = "[TRANSIENT]"
+ERROR_PREFIX_LLM = "[LLM_ERROR]"
+
+# Business logic gate (user sees this)
+if mission_id not in self.missions:
+    raise gl.vm.UserError(f"{ERROR_PREFIX_EXPECTED} Mission {mission_id} not found")
+
+# External API error — deterministic (tweet is gone)
+if web_data_res.status >= 400 and web_data_res.status < 500:
+    raise gl.vm.UserError(
+        f"{ERROR_PREFIX_EXTERNAL} X API failed to fetch {query_name} (HTTP {web_data_res.status})"
+    )
+
+# Transient — validators should soft-agree
+raise gl.vm.UserError(
+    f"{ERROR_PREFIX_TRANSIENT} X API temporarily unavailable for {query_name}"
+)
+
+# LLM parse failure — always retry
+raise gl.vm.UserError(
+    f"{ERROR_PREFIX_LLM} LLM returned non-dict response: {type(analysis)}"
+)
+```
+
+## `quality_score_comparison`
+
+For bounded LLM quality scores (0–5 range), allow ±1 tolerance between leader and validator — except when either side returns 0. A zero score is a gate failure, which is a binary decision that must match exactly.
+
+```python
+def quality_score_comparison(leader_score: int, validator_score: int) -> bool:
+    """Comparison rule: if either score is zero -> must match exactly; else +/-1 tolerance"""
+    leader_score = int(from_atto(leader_score))
+    validator_score = int(from_atto(validator_score))
+    if leader_score == 0 or validator_score == 0:
+        return leader_score == validator_score
+    return abs(leader_score - validator_score) <= 1
+```
+
+Use this for quality metrics (engagement potential, technical quality, reply quality) that score 0–5.
+
+## `raw_score_comparison`
+
+For unbounded engagement metrics (retweet counts, follower reach, impressions), exact match is impossible across validators. Use a log10 ratio bound instead — a validator result within 2× of the leader's result is accepted.
+
+```python
+def raw_score_comparison(leader_score: int, validator_score: int) -> bool:
+    """Comparison rule for raw metrics using log10 with 5x/0.5x tolerance bounds"""
+    leader_score_float = from_atto(leader_score)
+    validator_score_float = from_atto(validator_score)
+    validator_log = log10(validator_score_float + 2)
+    leader_log = log10(leader_score_float + 2)
+    if leader_log > 5 * validator_log or leader_log < 0.5 * validator_log:
+        return False
+    return True
+```
+
+The `+ 2` offset handles the zero case and compresses the low-count range where small absolute differences in follower counts would otherwise cause consensus failures.
+
+## `gl.storage.copy_to_memory`
+
+Storage cannot be read inside a `leader_fn` (the nondet boundary creates a snapshot). If you need to query a vector store or other storage field from within the nondet block, snapshot it **before** calling `gl.vm.run_nondet_unsafe`.
+
+```python
+# Outside the nondet block — reads storage normally
+tweet_store_memory = gl.storage.copy_to_memory(self.tweet_store)
+
+def leader_fn():
+    # Inside the nondet block — use the memory copy, not self.tweet_store
+    similar_tweets_vectors = list(
+        tweet_store_memory.knn(tweet_embedding, ORIGINALITY_KNN_CANDIDATE_LIMIT)
+    )
+    # ... filter and use results
+```
+
+Any storage field you need inside `leader_fn` must be either:
+- Copied with `gl.storage.copy_to_memory` (for complex types like `VecDB`), or
+- Captured as a plain Python variable before the `def leader_fn():` block.
+
+## `emit(on='accepted')` vs `emit()`
+
+| Form | When it fires | Use for |
+|---|---|---|
+| `.emit(on='accepted')` | After the transaction reaches finality | Cross-contract calls that must only happen if consensus was reached |
+| `.emit()` | Immediately, during execution | Calls where the effect should be part of the same execution (rare) |
+
+```python
+# Shard analysis — only start if this transaction is accepted
+shard_contract.emit(on='accepted').analyze_submission(
+    mission_id,
+    tweet_id,
+    now_period_index,
+    self._build_submission_payload(new_submission),
+    self._build_shard_analysis_context(mission_id),
+)
+
+# Bridge message — fire immediately (bridge contract handles idempotency)
+bridge_contract.emit().send_message(
+    self.distribution_contract_chain_id,
+    self.distribution_contract_address,
+    message_bytes,
+)
+```
+
+<Callout type="info">
+  Messages to EVM contracts can only be emitted on finality — use `.emit()` without `on='accepted'` for those. For cross-IC calls where you want the child contract to run only after consensus, use `.emit(on='accepted')`.
+</Callout>

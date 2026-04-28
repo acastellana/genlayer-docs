@@ -1,0 +1,7 @@
+{
+  "consensus": "Consensus & Nondet Patterns",
+  "llm-integration": "LLM Integration Patterns",
+  "contract-architecture": "Contract Architecture Patterns",
+  "data-modeling": "Data Modeling Patterns",
+  "evm-integration": "EVM Integration Patterns"
+}

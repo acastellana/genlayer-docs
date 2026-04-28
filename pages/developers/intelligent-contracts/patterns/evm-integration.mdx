@@ -1,0 +1,296 @@
+import { Callout } from 'nextra-theme-docs'
+
+# EVM Integration Patterns
+
+Patterns for bridging data and reading state from EVM chains — ABI encoding, idempotency guards, eth_call via HTTP, and identity verification.
+
+## EVM Bridge via MethodEncoder
+
+To send data from an intelligent contract to an EVM contract, ABI-encode the payload with `genvm_eth.MethodEncoder`, strip the 4-byte selector (current workaround), then fire via `bridge_contract.emit().send_message(...)`.
+
+```python
+genvm_eth = gl.evm
+
+@gl.public.write
+def bridge_period_distribution(self, period_index: int):
+    # Get the distribution to bridge
+    distribution = self.get_period_distribution(period_index)
+
+    # ABI-encode: (string[], uint256[], uint32) — matches Solidity function signature
+    abi = [DynArray[str], DynArray[u256], u32]
+    encoder = genvm_eth.MethodEncoder("", abi, bool)
+
+    message_data = [
+        distribution.keys(),
+        distribution.values(),
+        period_index,
+    ]
+
+    message_bytes = encoder.encode_call(message_data)
+    # TODO: currently need to remove the first 4 bytes (selector)
+    message_bytes = message_bytes[4:]
+
+    # Send to bridge contract
+    bridge_contract = gl.get_contract_at(self.bridge_sender)
+    bridge_contract.emit().send_message(
+        self.distribution_contract_chain_id,
+        self.distribution_contract_address,
+        message_bytes,
+    )
+
+    self.processed_periods[period_index] = True
+```
+
+For Merkle root bridging (more compact, gas-efficient on the EVM side):
+
+```python
+@gl.public.write
+def bridge_period_merkle_root(self, period_index: int):
+    # ...compute leaves, root, sum...
+    abi = [u256, u256, u256, u256, u256]
+    encoder = genvm_eth.MethodEncoder("", abi, bool)
+
+    message_data = [
+        MERKLE_MESSAGE_MAGIC_U256,  # routing magic so EVM knows which decoder to use
+        period_index,
+        root_u256,
+        sum_shares_atto,
+        leaf_count,
+    ]
+
+    message_bytes = encoder.encode_call(message_data)
+    message_bytes = message_bytes[4:]  # strip selector
+
+    bridge_contract = gl.get_contract_at(self.bridge_sender)
+    bridge_contract.emit().send_message(
+        self.distribution_contract_chain_id,
+        self.distribution_contract_address,
+        message_bytes,
+    )
+```
+
+<Callout type="info">
+  The `[4:]` selector strip is a current GenLayer workaround. The `MethodEncoder` always includes a 4-byte function selector, but `send_message` payloads are raw ABI-encoded data without a selector on the EVM decoding side.
+</Callout>
+
+## Idempotency Guard + Delay
+
+Bridging operations must be idempotent — running them twice should not double-credit users. Two guards enforce this:
+
+1. **`processed_periods` TreeMap** — tracks which periods have already been bridged
+2. **`DELAY_FOR_BRIDGING_HOURS` cooldown** — requires the period to have been over for at least 4 hours before bridging is allowed (gives time for late submissions to settle)
+
+```python
+DELAY_FOR_BRIDGING_HOURS = 4
+
+@gl.public.write
+def bridge_period_distribution(self, period_index: int):
+    # Guard 1: period must be complete
+    if period_index >= self.get_now_period_index():
+        raise gl.vm.UserError(f"{ERROR_PREFIX_EXPECTED} Period is not complete")
+
+    # Guard 2: cooldown window must have elapsed
+    period_end = self._get_period_end_time(period_index)
+    bridge_allowed_at = period_end + timedelta(hours=DELAY_FOR_BRIDGING_HOURS)
+    now = datetime.now(timezone.utc)
+    if now < bridge_allowed_at:
+        remaining = bridge_allowed_at - now
+        raise gl.vm.UserError(
+            f"{ERROR_PREFIX_EXPECTED} Bridging not allowed yet. Wait {remaining} until {bridge_allowed_at.isoformat()}"
+        )
+
+    # Guard 3: not already processed
+    if (
+        period_index in self.processed_periods
+        and self.processed_periods[period_index]
+    ):
+        raise gl.vm.UserError(f"{ERROR_PREFIX_EXPECTED} Period already processed")
+
+    # ... bridge logic ...
+
+    # Mark as processed (idempotency)
+    self.processed_periods[period_index] = True
+```
+
+Storage declaration:
+
+```python
+processed_periods: TreeMap[u256, bool]  # period_index -> bridged?
+```
+
+## `request_to_rpc` — Reading EVM State
+
+To read state from an EVM contract (e.g., verify a payment), construct an `eth_call` JSON-RPC payload, POST it via `gl.nondet.web.post`, and decode the 32-byte big-endian response.
+
+```python
+def request_to_rpc(
+    self, rpc_url: str, contract_address: str, call_data: bytes
+) -> bytes:
+    """Make an eth_call RPC request to read data from an EVM contract."""
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [
+            {"to": contract_address, "data": "0x" + call_data.hex()},
+            "latest",
+        ],
+        "id": 1,
+    }
+    web_data_res = gl.nondet.web.post(
+        rpc_url,
+        body=json.dumps(rpc_payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    if web_data_res.status != 200 or not web_data_res.body:
+        raise gl.vm.UserError(
+            f"{ERROR_PREFIX_EXTERNAL} Failed to make RPC call: {web_data_res.body}"
+        )
+    rpc_data = web_data_res.body.decode("utf-8")
+    response = json.loads(rpc_data)
+
+    if "error" in response:
+        raise gl.vm.UserError(f"{ERROR_PREFIX_EXTERNAL} RPC error: {response['error']}")
+
+    result_hex = response.get("result", "0x")
+    if result_hex.startswith("0x"):
+        result_hex = result_hex[2:]
+    return bytes.fromhex(result_hex) if result_hex else b""
+```
+
+Usage — verifying an EVM payment:
+
+```python
+def verify_submission_payment(
+    self, rpc_url: str, distribution_contract_address: str, tweet_id: str
+) -> bool:
+    # ABI-encode the call
+    encoder = genvm_eth.MethodEncoder("tweetSubmissions", [str], bool)
+    call_data = encoder.encode_call([tweet_id])
+
+    # Execute the RPC call
+    result_bytes = self.request_to_rpc(rpc_url, distribution_contract_address, call_data)
+
+    # Decode bool from 32-byte big-endian word
+    is_paid = bool(int.from_bytes(result_bytes, byteorder="big"))
+    return is_paid
+```
+
+This call happens inside the `leader_fn` nondet block, so consensus validates that all validators agree on the payment status.
+
+## HTTP Error Classification
+
+When making HTTP requests to external APIs inside a nondet block, classify errors by status code so validators can reach the right consensus behavior:
+
+```python
+def request_to_x(self, proxy_url, endpoint, params, query_name):
+    url = f"{proxy_url}/{endpoint}?{urllib.parse.urlencode(params)}"
+    web_data_res = gl.nondet.web.get(url)
+
+    if web_data_res.status != 200 or not web_data_res.body:
+        # 4xx: deterministic (tweet not found, invalid request)
+        # → EXTERNAL prefix → validators require exact message match
+        if web_data_res.status >= 400 and web_data_res.status < 500:
+            raise gl.vm.UserError(
+                f"{ERROR_PREFIX_EXTERNAL} X API failed to fetch {query_name} (HTTP {web_data_res.status})"
+            )
+        # 5xx: transient (server unavailable)
+        # → TRANSIENT prefix → validators soft-agree
+        else:
+            raise gl.vm.UserError(
+                f"{ERROR_PREFIX_TRANSIENT} X API temporarily unavailable for {query_name}"
+            )
+
+    return json.loads(web_data_res.body.decode("utf-8"))
+```
+
+For the external multiplier endpoint, some 4xx codes (401, 403, 429) indicate rate limiting or auth issues (transient), not "user not found" (deterministic), so they get separate treatment:
+
+```python
+res = gl.nondet.web.post(external_multiplier_url, body=post_body, headers=post_headers)
+if res.status >= 500 or res.status in (401, 403, 429):
+    raise gl.vm.UserError(
+        f"{ERROR_PREFIX_TRANSIENT} External multiplier API returned HTTP {res.status}"
+    )
+# 400/404/422 → user not eligible (deterministic 0 multiplier, not an error)
+body = res.body.decode("utf-8") if res.body else ""
+atto_ext_mult = _parse_external_multiplier(res.status, body)
+```
+
+The rule of thumb: if the same request will always fail the same way (tweet deleted, user not found), use `[EXTERNAL]`. If the failure is transient (server overload, rate limit), use `[TRANSIENT]`.
+
+## XID Challenge-Response Identity
+
+XID links an X (Twitter) account to a wallet address using a keccak256 challenge token. The flow requires two transactions separated by a user action on X.
+
+**Step 1 — initiate:** generate a token, store it against the sender's address.
+
+```python
+@gl.public.write
+def initiate_address_link(self, x_id: str):
+    x_id = str(x_id).strip()
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    expiry = timestamp + 3600  # 1 hour window
+
+    hasher = Keccak256()
+    hasher.update(datetime.now().isoformat().encode())
+    hasher.update(gl.message.sender_address.as_bytes)
+    token = hasher.digest().hex()
+
+    token_info = TokenInfo(token=token, expiry=expiry, username="", x_id=x_id)
+    self.address_token_map[gl.message.sender_address] = token_info
+    return token
+```
+
+Between the two transactions, the user posts a tweet containing the token:
+
+```
+Verifying my wallet for @RallyOnChain: <token>
+```
+
+**Step 2 — complete:** fetch the tweet via `gl.eq_principle.strict_eq`, verify the author ID matches the claimed X ID, and store the link.
+
+```python
+@gl.public.write
+def complete_address_link(self, post_url: str):
+    sender = gl.message.sender_address
+    token_info = self.address_token_map[sender]
+
+    current_time = int(datetime.now(timezone.utc).timestamp())
+    if current_time > token_info.expiry:
+        del self.address_token_map[sender]
+        raise gl.vm.UserError("Token has expired, please initiate a new link")
+
+    tweet_id = extract_tweet_id_from_url(post_url)
+    content, tweet_time, author_id = self.get_tweet_content(tweet_id)
+
+    # Author ID must match the claimed X user ID
+    if author_id != token_info.x_id:
+        raise gl.vm.UserError(
+            "Tweet author mismatch. The tweet must be posted by the X account that initiated linking"
+        )
+
+    # Tweet must be recent
+    if datetime.now(timezone.utc) - tweet_time > timedelta(hours=1):
+        raise gl.vm.UserError("Tweet is too old")
+
+    # Token must appear verbatim in the tweet
+    expected_format = f"Verifying my wallet for @RallyOnChain: {token_info.token}"
+    if expected_format not in content:
+        raise gl.vm.UserError("Invalid token format in tweet")
+
+    # Store the verified link: x_id -> wallet bytes
+    self.username_address_map[token_info.x_id] = sender.as_bytes
+    del self.address_token_map[sender]  # consume the token
+```
+
+The tweet fetch uses `gl.eq_principle.strict_eq` because the tweet content is deterministic — all validators reading the same tweet ID get the same response.
+
+```python
+def get_tweet_content(self, tweet_id: str):
+    def call_x_api():
+        web_data_res = gl.nondet.web.get(url)
+        # ...
+        return json.loads(web_data_res.body.decode("utf-8"))
+
+    return gl.eq_principle.strict_eq(call_x_api)
+```

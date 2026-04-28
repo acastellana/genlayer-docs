@@ -1,0 +1,205 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Data Modeling Patterns
+
+Conventions for defining storage types, encoding numbers, choosing collections, and managing schema evolution in intelligent contracts.
+
+## `@allow_storage` + `@dataclass`
+
+Both decorators are required for any class you store in contract state. Order matters: `@allow_storage` must come first.
+
+```python
+@allow_storage
+@dataclass
+class AnalysisRecord:
+    atto_score: u256
+    analysis: str
+    category: str
+    atto_max_score: u256
+```
+
+Nested types used inside a storage-eligible class must also carry both decorators:
+
+```python
+@allow_storage
+@dataclass
+class VectorStoreValue:
+    text: str
+    id: str
+
+@allow_storage
+@dataclass
+class MainSubmission:
+    # ...
+    analysis: DynArray[AnalysisRecord]  # AnalysisRecord must itself be @allow_storage
+```
+
+Omitting `@allow_storage` from a nested type produces a runtime error when the contract tries to serialize the value.
+
+## Atto/Wei Encoding
+
+GenLayer contracts cannot store raw floats in `u256` fields. Multiply by 10¹⁸ before storing and divide on the way out. The scale factor matches Ethereum's wei/atto convention.
+
+```python
+ATTO_SCALE = 10**18
+
+def to_atto(value: int | float) -> int:
+    if isinstance(value, int):
+        return value * ATTO_SCALE
+    return int(value * 1e18)
+
+def from_atto(value: int) -> float:
+    return value / ATTO_SCALE
+```
+
+Usage in the contract:
+
+```python
+# Store raw tweet metrics as atto integers
+atto_raw_retweets: u256 = to_atto(tweet_metrics["retweet_count"])
+atto_raw_likes: u256    = to_atto(tweet_metrics["like_count"])
+
+# Read back for arithmetic
+retweet_count = from_atto(self.atto_raw_retweets)   # float
+```
+
+The same trick applies to embedding serialization: `(embedding * 1e18).astype(np.int64)` makes float32 vectors safe to pass through the nondet boundary. See [LLM Integration Patterns](./llm-integration#embedding-serialization-int64-trick).
+
+## TreeMap vs DynArray
+
+| | `TreeMap[K, V]` | `DynArray[T]` |
+|---|---|---|
+| Lookup | O(log n) by key | O(n) scan |
+| Membership test | `key in map` | Iterate |
+| Iteration order | Sorted by key | Insertion order |
+| Use for | Keyed lookup, dedup tracking | Ordered history, pagination |
+
+Concrete examples from the contracts:
+
+```python
+# TreeMap — keyed lookup, O(log n)
+missions: TreeMap[str, Mission]               # mission_id -> Mission
+processed_periods: TreeMap[u256, bool]        # period_index -> processed?
+tweet_submissions_payments: TreeMap[str, bool] # tweet_id -> paid?
+
+# DynArray — ordered append-only lists
+submissions: DynArray[MainSubmission]         # all submissions in order
+shard_addresses: DynArray[Address]            # shard i is at index i
+gate_weights: DynArray[u256]                  # weight[0] = gate 0 weight
+```
+
+Use `DynArray` when you need pagination (`submissions[offset:offset+limit]`) or when the insertion order carries semantic meaning (e.g., which shard is index 0).
+
+## Timestamp as ISO String
+
+Store timestamps as timezone-aware ISO strings, not Unix integers. This makes them directly readable in view responses and avoids int/datetime conversion bugs.
+
+```python
+from datetime import datetime, timezone
+
+# Always timezone-aware
+timestamp: str = datetime.now(timezone.utc).isoformat()
+# → "2025-01-15T10:30:00.123456+00:00"
+
+# Parse back for comparison
+dt = datetime.fromisoformat(submission.timestamp)
+```
+
+Convert to Unix timestamp only at an API boundary, when a client explicitly needs it:
+
+```python
+# In a view method, if a client needs a Unix timestamp
+created_since_dt = datetime.fromtimestamp(filter_created_since, tz=timezone.utc)
+```
+
+<Callout type="warning">
+  Never use `datetime.now()` without `timezone.utc`. Naive datetimes compare incorrectly with aware ones and will produce subtle ordering bugs in period calculations.
+</Callout>
+
+## Address Serialization
+
+Three address forms, each with a specific use:
+
+```python
+# .as_hex — return from view methods (genlayer-js expects hex strings)
+"creator_address": self.creator_address.as_hex,
+"shard_addresses": [addr.as_hex for addr in self.shard_addresses],
+
+# .as_bytes — use as dict/TreeMap key (bytes are hashable)
+self.username_address_map[x_id] = sender.as_bytes   # bytes value in TreeMap
+
+# Address(raw) — reconstruct from string or bytes
+address = Address(self.referral_ic_address)  # from stored hex string
+address = Address(raw_bytes)                 # from stored bytes
+```
+
+Always use `.as_hex` in view method return values. genlayer-js and front-end clients expect hex addresses, not bytes objects.
+
+## `get_version()`
+
+Expose a simple version string as a view method. Clients can branch on it to handle schema or behavior changes across deployed contract versions.
+
+```python
+@gl.public.view
+def get_version(self) -> str:
+    return "0.6.3"  # Originality pre-filter: distance threshold + zero-score candidate exclusion
+```
+
+Keep the inline comment describing the last meaningful change. This is cheap documentation that survives on-chain forever and lets you reconstruct what changed between versions without access to git history.
+
+## Storage Layout Append-Only Rule
+
+Never remove or reorder fields in a contract's storage layout. The GenVM serializes fields positionally — removing or moving a field shifts the offsets of everything after it, corrupting stored state on upgrade.
+
+From `XID.py`:
+
+```python
+class XID(gl.Contract):
+    # NOTE: Field order is storage-layout sensitive. Append new fields at END only.
+    owner: Address
+    username_address_map: TreeMap[str, bytes]
+    address_token_map: TreeMap[Address, TokenInfo]
+    target_chains: TreeMap[u256, str]
+    bridge_sender: Address
+    tweet_api_url: str
+    # New fields must be added below this line (after tweet_api_url)
+```
+
+From `CampaignFactory`:
+
+```python
+class CampaignFactory(gl.Contract):
+    # WARNING: Field order matters for upgrades! Add new fields at END only.
+    contract_addresses: DynArray[str]
+    x_id_contract: str
+    campaign_code: str
+    # ...
+    # New fields must be added below this line (after tweet_api_url)
+    shard_code: str
+    referral_ic_address: str
+```
+
+The convention is to add an explicit comment after the last "stable" field indicating where it's safe to append. For existing deployments, if a field must be deprecated, set it to a sentinel value rather than removing it.
+
+## Dependency Declarations Header
+
+Declare package dependencies in a structured comment at the top of the contract file. This tells the GenLayer runtime which packages to bundle at deploy time.
+
+Single dependency:
+
+```python
+# { "Depends": "py-genlayer:1j12s63yfjpva9ik2xgnffgrs6v44y1f52jvj9w7xvdn7qckd379" }
+```
+
+Multiple dependencies (sequential list):
+
+```python
+# {
+#   "Seq": [
+#     { "Depends": "py-lib-genlayer-embeddings:0bmbm3cyfwxsyh454z53vxqjf47wz2q7smcqp1q4g4a6k2kidnyk" },
+#     { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+#   ]
+# }
+```
+
+The hash after the colon is the content hash of the package — pinning to a specific version. If you need a package that's not in the registry, use the `Seq` form to list dependencies in order.
